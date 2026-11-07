@@ -116,7 +116,7 @@ export default {
             
             <!-- 注册引导小字 -->
             <div style="text-align: center; margin-top: 15px; font-size: 13px; color: #9ca3af;">
-              第一次使用？<a href="https://你的CloudMail域名" target="_blank" style="color: #3b82f6; text-decoration: none;">注册</a>
+              第一次使用？<a href="https://mail.yuhang.dpdns.org" target="_blank" style="color: #3b82f6; text-decoration: none;">注册</a>
             </div>
           </div>
 
