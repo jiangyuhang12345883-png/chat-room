@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 // ⚠️⚠️⚠️ 请把这里的地址换成你自己的 Cloud Mail 实际 API 地址 ⚠️⚠️⚠️
-const CLOUD_MAIL_API = "https://你的CloudMail域名/api/login";
+const CLOUD_MAIL_API = "https://mail.yuhang.dpdns.org/api/login";
 
 export class ChatRoom extends DurableObject {
   constructor(ctx, env) {
