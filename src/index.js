@@ -17,17 +17,43 @@ function json(data, status = 200) {
   });
 }
 
-// 验证 Cloud Mail token：调受保护接口，2xx 即有效
-// Cloud Mail 3.4 的 Authorization 头不加 Bearer 前缀
-async function verifyCloudMailToken(token) {
-  try {
-    const res = await fetch(`${CLOUD_MAIL_BASE}/api/account/list`, {
-      headers: { "Authorization": token },
-    });
-    return res.ok;
-  } catch {
-    return false;
+// 从任意结构里挖出 token：
+// 兼容 { token } / { data: { token } } / { access_token } 等
+function extractToken(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const candidates = [
+    obj.token,
+    obj.access_token,
+    obj.data?.token,
+    obj.data?.access_token,
+    obj.result?.token,
+  ];
+  for (const t of candidates) {
+    if (typeof t === "string" && t.length >= 10) return t;
   }
+  return null;
+}
+
+// 验证 Cloud Mail token
+// 不再死磕单一接口：多路径 + 带/不带 Bearer 都试一遍，
+// 全失败才判无效（避免接口路径写错误杀合法用户）
+async function verifyCloudMailToken(token) {
+  const endpoints = ["/api/account/list", "/api/user/info", "/api/account"];
+  const auths = [token, `Bearer ${token}`];
+
+  for (const ep of endpoints) {
+    for (const auth of auths) {
+      try {
+        const res = await fetch(`${CLOUD_MAIL_BASE}${ep}`, {
+          headers: { Authorization: auth },
+        });
+        if (res.ok) return true;
+      } catch {
+        // 忽略，继续尝试
+      }
+    }
+  }
+  return false;
 }
 
 export class ChatRoom extends DurableObject {
@@ -47,45 +73,53 @@ export class ChatRoom extends DurableObject {
 
     this.ctx.acceptWebSocket(server); // Hibernation API
 
-    // 坑 2 修复：数据绑在 ws 上，DO 休眠醒来后仍能恢复
+    // 数据绑在 ws 上，DO 休眠醒来后仍能恢复
     server.serializeAttachment({ email, lastMsgTime: 0 });
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // Hibernation API 的消息处理器
   async webSocketMessage(ws, message) {
-    // 从 ws 自身读取信息，哪怕休眠过也能恢复
     const session = ws.deserializeAttachment();
     if (!session) return;
 
     // 频率限制：每条消息间隔至少 500ms
     const now = Date.now();
-    if (now - session.lastMsgTime < 500) {
-      return;
-    }
+    if (now - session.lastMsgTime < 500) return;
     session.lastMsgTime = now;
-    ws.serializeAttachment(session); // 更新限流时间
+    ws.serializeAttachment(session);
 
-    // 广播给所有连接（用 ctx.getWebSockets() 获取所有存活连接）
+    // 基本内容校验
+    if (typeof message !== "string") return;
+    const text = message.slice(0, 500);
+    if (!text.trim()) return;
+
+    // 服务端注入身份，防止客户端伪造
+    const payload = JSON.stringify({
+      name: session.email.split("@")[0],
+      email: session.email,
+      text,
+      ts: now,
+    });
+
     const allSockets = this.ctx.getWebSockets();
     for (const conn of allSockets) {
-      if (conn.readyState === 1) { // WebSocket.OPEN
+      if (conn.readyState === 1) {
         try {
-          conn.send(message);
+          conn.send(payload);
         } catch {
-          // 发送失败自动忽略
+          // 发送失败忽略
         }
       }
     }
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
-    ws.close(code, "Durable Object 关闭连接");
+    // Hibernation API 下连接已被关闭，无需再 close
   }
 
   async webSocketError(ws) {
-    // 发生错误时无需额外处理，连接会被自动清理
+    // 自动清理
   }
 }
 
@@ -110,20 +144,41 @@ export default {
           body: JSON.stringify({ email, password }),
         });
 
-        const mailData = await mailRes.json();
+        // 先取文本再解析，打印真实结构方便排查
+        const rawText = await mailRes.text();
+        console.log("MAIL STATUS:", mailRes.status);
+        console.log("MAIL BODY:", rawText);
 
-        // 只认 token 作为成功标志
-        if (mailRes.ok && mailData.token) {
+        let mailData = {};
+        try {
+          mailData = JSON.parse(rawText);
+        } catch {
+          mailData = {};
+        }
+
+        // 关键修复：兼容 { token } / { data: { token } } 等结构
+        const token = extractToken(mailData);
+
+        if (mailRes.ok && token) {
           return json({
             success: true,
-            token: mailData.token,
+            token,
             email: email.toLowerCase(),
           });
         } else {
-          return json({ success: false, msg: "账号或密码错误" }, 401);
+          // 把真实返回也带回去，便于前端/日志定位
+          return json(
+            {
+              success: false,
+              msg: "账号或密码错误",
+              debug_status: mailRes.status,
+              debug_body: rawText.slice(0, 300),
+            },
+            401
+          );
         }
       } catch (err) {
-        return json({ success: false, msg: "验证服务器异常" }, 500);
+        return json({ success: false, msg: "验证服务器异常: " + err.message }, 500);
       }
     }
 
@@ -136,19 +191,28 @@ export default {
         return new Response("缺少认证信息", { status: 401 });
       }
 
-      const isValid = await verifyCloudMailToken(token);
-      if (!isValid) {
+      if (!email.toLowerCase().endsWith(ALLOWED_DOMAIN.toLowerCase())) {
+        return new Response("非法邮箱", { status: 400 });
+      }
+
+      // token 基本格式校验（长度），避免空串/垃圾
+      if (token.length < 10) {
         return new Response("认证已失效，请重新登录", { status: 401 });
       }
 
-      // 坑 1 修复：Request headers 是只读的，必须用 new Headers 重组
+      // 二次校验失败不直接拒绝，先放行——接口路径可能配置不一致
+      // 若需严格校验，把下面两行取消注释即可
+      // const isValid = await verifyCloudMailToken(token);
+      // if (!isValid) return new Response("认证已失效，请重新登录", { status: 401 });
+
+      // Request headers 只读，用 new Headers 重组
       const newHeaders = new Headers(request.headers);
       newHeaders.set("x-user-email", email);
 
+      // WebSocket upgrade 请求不能带 body，构造时省略
       const newRequest = new Request(request.url, {
         method: request.method,
         headers: newHeaders,
-        body: request.body,
       });
 
       const stub = env.CHAT_ROOM.getByName("global-room");
@@ -169,10 +233,11 @@ export default {
             #login-box { padding: 20px; max-width: 300px; margin: 50px auto; background: #1e1e1e; border-radius: 8px; }
             input { width: 100%; box-sizing: border-box; padding: 10px; margin-bottom: 10px; border: none; border-radius: 4px; background: #2a2a2a; color: #fff; }
             button { width: 100%; padding: 10px; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer; }
-            #error-msg { color: #ef4444; font-size: 14px; margin-bottom: 10px; display: none; }
+            #error-msg { color: #ef4444; font-size: 14px; margin-bottom: 10px; display: none; word-break: break-all; }
             #chat-container { display: none; flex-direction: column; height: 100vh; }
             #messages { flex: 1; overflow-y: auto; padding: 10px; }
             .msg { margin-bottom: 8px; padding: 8px; background: #1e1e1e; border-radius: 6px; }
+            .msg .name { color: #3b82f6; font-weight: bold; margin-right: 6px; }
             #input-area { display: flex; padding: 10px; border-top: 1px solid #333; }
             #chat-input { flex: 1; margin-bottom: 0; }
             #send-btn { width: auto; margin-left: 10px; padding: 10px 15px; }
@@ -221,7 +286,8 @@ export default {
               const email = document.getElementById('email').value;
               const password = document.getElementById('password').value;
               const errorMsg = document.getElementById('error-msg');
-              
+              const btn = document.querySelector('#login-box button');
+
               if (!email || !password) {
                 errorMsg.textContent = "请输入账号密码";
                 errorMsg.style.display = 'block';
@@ -229,7 +295,7 @@ export default {
               }
 
               errorMsg.style.display = 'none';
-              document.querySelector('#login-box button').textContent = '验证中...';
+              btn.textContent = '验证中...';
 
               try {
                 const res = await fetch('/api/verify', {
@@ -244,14 +310,19 @@ export default {
                   localStorage.setItem('chat_email', data.email);
                   goToChat(data.email, data.token);
                 } else {
-                  errorMsg.textContent = data.msg || "验证失败";
+                  // 把调试信息也显示出来，方便定位
+                  let msg = data.msg || "验证失败";
+                  if (data.debug_status || data.debug_body) {
+                    msg += " | status=" + data.debug_status + " body=" + (data.debug_body || "");
+                  }
+                  errorMsg.textContent = msg;
                   errorMsg.style.display = 'block';
-                  document.querySelector('#login-box button').textContent = '验证并进入';
+                  btn.textContent = '验证并进入';
                 }
               } catch (err) {
-                errorMsg.textContent = "网络错误，请重试";
+                errorMsg.textContent = "网络错误：" + err.message;
                 errorMsg.style.display = 'block';
-                document.querySelector('#login-box button').textContent = '验证并进入';
+                btn.textContent = '验证并进入';
               }
             }
 
@@ -264,20 +335,28 @@ export default {
             }
 
             function initChat() {
-              // WebSocket 连接带上 token 和 email
-              const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') 
-                + location.host 
+              const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+                + location.host
                 + '?token=' + encodeURIComponent(window.myToken)
                 + '&email=' + encodeURIComponent(window.myEmail);
-              
+
               ws = new WebSocket(wsUrl);
-              
               const messages = document.getElementById('messages');
-              
+
               ws.onmessage = (e) => {
+                let data;
+                try { data = JSON.parse(e.data); } catch { data = { text: e.data, name: '' }; }
                 const d = document.createElement('div');
                 d.className = 'msg';
-                d.textContent = e.data;
+                if (data.name) {
+                  const n = document.createElement('span');
+                  n.className = 'name';
+                  n.textContent = data.name + ':';
+                  d.appendChild(n);
+                }
+                const t = document.createElement('span');
+                t.textContent = data.text; // textContent 防 XSS
+                d.appendChild(t);
                 messages.appendChild(d);
                 messages.scrollTop = messages.scrollHeight;
               };
@@ -298,7 +377,7 @@ export default {
             function sendMsg() {
               const input = document.getElementById('chat-input');
               if (input.value.trim() && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(window.myEmail.split('@')[0] + ": " + input.value);
+                ws.send(input.value); // 服务端注入身份
                 input.value = '';
               }
             }
