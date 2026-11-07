@@ -51,7 +51,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // 1. 登录验证接口
     if (url.pathname === "/api/verify" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -70,7 +69,6 @@ export default {
 
         if (mailRes.ok) {
           const mailData = await mailRes.json();
-          // 返回真实的 token 和邮箱给前端保存
           const token = mailData.token || "fallback_token_" + Date.now();
           return new Response(JSON.stringify({ 
             success: true, 
@@ -85,7 +83,6 @@ export default {
       }
     }
 
-    // 2. 网页界面
     if (request.headers.get("Upgrade") !== "websocket") {
       const html = `
         <!DOCTYPE html>
@@ -102,9 +99,9 @@ export default {
             #error-msg { color: #ef4444; font-size: 14px; margin-bottom: 10px; display: none; }
             
             #chat-container { display: none; flex-direction: column; height: 100vh; }
-            #messages { flex: 1; overflow-y: auto; padding: 10px; border-bottom: 1px solid #333; }
+            #messages { flex: 1; overflow-y: auto; padding: 10px; }
             .msg { margin-bottom: 8px; padding: 8px; background: #1e1e1e; border-radius: 6px; }
-            #input-area { display: flex; padding: 10px; }
+            #input-area { display: flex; padding: 10px; border-top: 1px solid #333; }
             #chat-input { flex: 1; margin-bottom: 0; }
             #send-btn { width: auto; margin-left: 10px; padding: 10px 15px; }
           </style>
@@ -123,6 +120,12 @@ export default {
           </div>
 
           <div id="chat-container">
+            <!-- 顶部退出栏 -->
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #1e1e1e; border-bottom: 1px solid #333;">
+              <span style="font-weight: bold; color: #3b82f6;">在线聊天室</span>
+              <button onclick="logout()" style="width: auto; padding: 5px 10px; background: #ef4444; font-size: 13px;">退出登录</button>
+            </div>
+
             <div id="messages"></div>
             <div id="input-area">
               <input id="chat-input" placeholder="输入消息..." autocomplete="off">
@@ -133,16 +136,21 @@ export default {
           <script>
             let ws;
 
-            // 页面一加载，先检查有没有历史登录记录
             window.onload = () => {
               const savedToken = localStorage.getItem('chat_token');
               const savedEmail = localStorage.getItem('chat_email');
               
               if (savedToken && savedEmail) {
-                // 如果有记录，直接进聊天室
                 goToChat(savedEmail);
               }
             };
+
+            function logout() {
+              // 清除本地记录并刷新
+              localStorage.removeItem('chat_token');
+              localStorage.removeItem('chat_email');
+              location.reload();
+            }
 
             async function verifyLogin() {
               const email = document.getElementById('email').value;
@@ -168,10 +176,8 @@ export default {
                 const data = await res.json();
 
                 if (data.success) {
-                  // 把 Token 和邮箱存进浏览器
                   localStorage.setItem('chat_token', data.token);
                   localStorage.setItem('chat_email', data.email);
-                  // 进入聊天室
                   goToChat(data.email);
                 } else {
                   errorMsg.textContent = data.msg || "验证失败";
@@ -224,7 +230,6 @@ export default {
       return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
-    // WebSocket 连接处理
     const stub = env.CHAT_ROOM.getByName("global-room");
     return stub.fetch(request);
   },
