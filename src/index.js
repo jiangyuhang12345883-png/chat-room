@@ -6,7 +6,7 @@ const CLOUD_MAIL_API = "https://mail.yuhang.dpdns.org/api/login";
 const CLOUD_MAIL_REGISTER_URL = "https://mail.yuhang.dpdns.org";
 // ⚠️ 3. 强制要求的邮箱后缀
 const ALLOWED_DOMAIN = "@yuhang.dpdns.org";
-// ⚠️ 4. Cloud Mail 基础地址（用于 token 校验）
+// ⚠️ 4. Cloud Mail 基础地址
 const CLOUD_MAIL_BASE = "https://mail.yuhang.dpdns.org";
 
 // 统一 JSON 响应
@@ -17,8 +17,7 @@ function json(data, status = 200) {
   });
 }
 
-// 从任意结构里挖出 token：
-// 兼容 { token } / { data: { token } } / { access_token } 等
+// 从登录返回里挖 token
 function extractToken(obj) {
   if (!obj || typeof obj !== "object") return null;
   const candidates = [
@@ -34,25 +33,29 @@ function extractToken(obj) {
   return null;
 }
 
-// 验证 Cloud Mail token
-// 多路径 + 带/不带 Bearer 都试一遍，全失败才判无效
+// 验证 Cloud Mail token —— 真实校验
+// endpoint: /api/account/list，Authorization 裸 token（实测确认）
+// 同时检查 HTTP 状态 + body.code，兼容 Cloud Mail 用 HTTP 200 包装业务错误
 async function verifyCloudMailToken(token) {
-  const endpoints = ["/api/account/list", "/api/user/info", "/api/account"];
-  const auths = [token, `Bearer ${token}`];
+  try {
+    const res = await fetch(`${CLOUD_MAIL_BASE}/api/account/list`, {
+      headers: { Authorization: token },
+    });
 
-  for (const ep of endpoints) {
-    for (const auth of auths) {
-      try {
-        const res = await fetch(`${CLOUD_MAIL_BASE}${ep}`, {
-          headers: { Authorization: auth },
-        });
-        if (res.ok) return true;
-      } catch {
-        // 忽略，继续尝试
-      }
+    if (!res.ok) return false;
+
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      return false;
     }
+
+    if (body && body.code === 200) return true;
+    return false;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 export class ChatRoom extends DurableObject {
@@ -61,7 +64,6 @@ export class ChatRoom extends DurableObject {
       return new Response("Expected WebSocket", { status: 426 });
     }
 
-    // 从 Worker 传递的 header 中读取已验证的用户邮箱
     const email = request.headers.get("x-user-email");
     if (!email) {
       return new Response("Unauthorized", { status: 401 });
@@ -70,9 +72,8 @@ export class ChatRoom extends DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    this.ctx.acceptWebSocket(server); // Hibernation API
+    this.ctx.acceptWebSocket(server);
 
-    // 数据绑在 ws 上，DO 休眠醒来后仍能恢复
     server.serializeAttachment({ email, lastMsgTime: 0 });
 
     return new Response(null, { status: 101, webSocket: client });
@@ -82,18 +83,15 @@ export class ChatRoom extends DurableObject {
     const session = ws.deserializeAttachment();
     if (!session) return;
 
-    // 频率限制：每条消息间隔至少 500ms
     const now = Date.now();
     if (now - session.lastMsgTime < 500) return;
     session.lastMsgTime = now;
     ws.serializeAttachment(session);
 
-    // 基本内容校验
     if (typeof message !== "string") return;
     const text = message.slice(0, 500);
     if (!text.trim()) return;
 
-    // 服务端注入身份，防止客户端伪造
     const payload = JSON.stringify({
       name: session.email.split("@")[0],
       email: session.email,
@@ -107,14 +105,14 @@ export class ChatRoom extends DurableObject {
         try {
           conn.send(payload);
         } catch {
-          // 发送失败忽略
+          // 忽略
         }
       }
     }
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
-    // Hibernation API 下连接已被关闭，无需再 close
+    // 无需再 close
   }
 
   async webSocketError(ws) {
@@ -134,7 +132,10 @@ export default {
         const password = body.password;
 
         if (!email || !password || !email.toLowerCase().endsWith(ALLOWED_DOMAIN.toLowerCase())) {
-          return json({ success: false, msg: "请使用专用邮箱登录" }, 400);
+          return json(
+            { success: false, msg: `请使用 ${ALLOWED_DOMAIN} 结尾的邮箱登录` },
+            400
+          );
         }
 
         const mailRes = await fetch(CLOUD_MAIL_API, {
@@ -143,7 +144,6 @@ export default {
           body: JSON.stringify({ email, password }),
         });
 
-        // 先取文本再解析，便于日志排查（原始返回只进 console，不进用户界面）
         const rawText = await mailRes.text();
         console.log("MAIL STATUS:", mailRes.status);
         console.log("MAIL BODY:", rawText);
@@ -155,26 +155,39 @@ export default {
           mailData = {};
         }
 
-        // 兼容 { token } / { data: { token } } 等结构
         const token = extractToken(mailData);
+        // 只认实测确认的成功码，不再为"无 code"留后门
+        const bizOk = mailData?.code === 200;
 
-        if (mailRes.ok && token) {
+        if (mailRes.ok && token && bizOk) {
           return json({
             success: true,
             token,
             email: email.toLowerCase(),
           });
         } else {
-          // 透传 Cloud Mail 真实业务提示（如"输入的邮箱不存在"）
-          const bizMsg =
-            mailData?.message ||
-            mailData?.msg ||
-            "账号或密码错误";
+          const bizMsg = mailData?.message || mailData?.msg || "账号或密码错误";
           return json({ success: false, msg: bizMsg }, 401);
         }
       } catch (err) {
         console.log("VERIFY ERROR:", err.message);
         return json({ success: false, msg: "验证服务器异常" }, 500);
+      }
+    }
+
+    // ========== token 有效性探测（自动重连用） ==========
+    if (url.pathname === "/api/check-token" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const token = body.token;
+        if (!token || typeof token !== "string") {
+          return json({ valid: false }, 401);
+        }
+
+        const ok = await verifyCloudMailToken(token);
+        return ok ? json({ valid: true }) : json({ valid: false }, 401);
+      } catch {
+        return json({ valid: false }, 400);
       }
     }
 
@@ -188,24 +201,17 @@ export default {
       }
 
       if (!email.toLowerCase().endsWith(ALLOWED_DOMAIN.toLowerCase())) {
-        return new Response("非法邮箱", { status: 400 });
+        return new Response(`仅支持 ${ALLOWED_DOMAIN} 结尾的邮箱`, { status: 400 });
       }
 
-      // token 基本格式校验（长度），避免空串/垃圾
-      if (token.length < 10) {
-        return new Response("认证已失效，请重新登录", { status: 401 });
+      const isValid = await verifyCloudMailToken(token);
+      if (!isValid) {
+        return new Response("登录已过期，请重新登录", { status: 401 });
       }
 
-      // 二次校验失败不直接拒绝，先放行——接口路径可能配置不一致
-      // 若需严格校验，把下面两行取消注释即可
-      // const isValid = await verifyCloudMailToken(token);
-      // if (!isValid) return new Response("认证已失效，请重新登录", { status: 401 });
-
-      // Request headers 只读，用 new Headers 重组
       const newHeaders = new Headers(request.headers);
       newHeaders.set("x-user-email", email);
 
-      // WebSocket upgrade 请求不能带 body，构造时省略
       const newRequest = new Request(request.url, {
         method: request.method,
         headers: newHeaders,
@@ -237,6 +243,7 @@ export default {
             #input-area { display: flex; padding: 10px; border-top: 1px solid #333; }
             #chat-input { flex: 1; margin-bottom: 0; }
             #send-btn { width: auto; margin-left: 10px; padding: 10px 15px; }
+            #conn-status { font-size: 12px; }
           </style>
         </head>
         <body>
@@ -253,7 +260,10 @@ export default {
 
           <div id="chat-container">
             <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #1e1e1e; border-bottom: 1px solid #333;">
-              <span style="font-weight: bold; color: #3b82f6;">在线聊天室</span>
+              <div style="display:flex; align-items:center; gap:10px;">
+                <span style="font-weight: bold; color: #3b82f6;">在线聊天室</span>
+                <span id="conn-status" style="color:#9ca3af;">已连接</span>
+              </div>
               <button onclick="logout()" style="width: auto; padding: 5px 10px; background: #ef4444; font-size: 13px;">退出登录</button>
             </div>
             <div id="messages"></div>
@@ -264,7 +274,11 @@ export default {
           </div>
 
           <script>
-            let ws;
+            let ws = null;
+            let reconnectAttempts = 0;
+            let reconnectTimer = null;
+            let manualClose = false;
+            const MAX_RECONNECT_DELAY = 30000;
 
             window.onload = () => {
               const savedToken = localStorage.getItem('chat_token');
@@ -273,9 +287,19 @@ export default {
             };
 
             function logout() {
+              manualClose = true;
+              if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+              if (ws) { try { ws.close(1000, "logout"); } catch {} }
               localStorage.removeItem('chat_token');
               localStorage.removeItem('chat_email');
               location.reload();
+            }
+
+            function setStatus(text, color) {
+              const el = document.getElementById('conn-status');
+              if (!el) return;
+              el.textContent = text;
+              el.style.color = color || '#9ca3af';
             }
 
             async function verifyLogin() {
@@ -306,7 +330,6 @@ export default {
                   localStorage.setItem('chat_email', data.email);
                   goToChat(data.email, data.token);
                 } else {
-                  // 只显示后端透传的真实提示，不再拼 JSON
                   errorMsg.textContent = data.msg || "验证失败";
                   errorMsg.style.display = 'block';
                   btn.textContent = '验证并进入';
@@ -323,10 +346,15 @@ export default {
               document.getElementById('chat-container').style.display = 'flex';
               window.myEmail = email;
               window.myToken = token;
-              initChat();
+              manualClose = false;
+              reconnectAttempts = 0;
+              connect();
             }
 
-            function initChat() {
+            function connect() {
+              if (manualClose) return;
+              if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
               const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://')
                 + location.host
                 + '?token=' + encodeURIComponent(window.myToken)
@@ -334,6 +362,11 @@ export default {
 
               ws = new WebSocket(wsUrl);
               const messages = document.getElementById('messages');
+
+              ws.onopen = () => {
+                reconnectAttempts = 0;
+                setStatus("已连接", "#22c55e");
+              };
 
               ws.onmessage = (e) => {
                 let data;
@@ -347,29 +380,60 @@ export default {
                   d.appendChild(n);
                 }
                 const t = document.createElement('span');
-                t.textContent = data.text; // textContent 防 XSS
+                t.textContent = data.text;
                 d.appendChild(t);
                 messages.appendChild(d);
                 messages.scrollTop = messages.scrollHeight;
               };
 
-              ws.onerror = () => {
-                alert('连接失败，请重新登录');
-                logout();
+              ws.onclose = async (e) => {
+                if (manualClose) return;
+                if (e.code === 1000) return;
+
+                setStatus("连接断开，检查登录状态...", "#f59e0b");
+                const stillValid = await probeToken(window.myToken);
+                if (!stillValid) {
+                  alert("登录已过期，请重新登录");
+                  logout();
+                  return;
+                }
+                scheduleReconnect();
               };
 
-              ws.onclose = (e) => {
-                if (e.code !== 1000) {
-                  alert('连接已断开，请重新登录');
-                  logout();
-                }
+              ws.onerror = () => {
+                // 交给 onclose 统一处理
               };
+            }
+
+            function scheduleReconnect() {
+              if (manualClose) return;
+              reconnectAttempts++;
+              const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
+              setStatus(`连接断开，${Math.round(delay / 1000)} 秒后重连（第 ${reconnectAttempts} 次）`, "#f59e0b");
+              reconnectTimer = setTimeout(() => {
+                if (!manualClose) connect();
+              }, delay);
+            }
+
+            async function probeToken(token) {
+              try {
+                const res = await fetch('/api/check-token', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ token }),
+                });
+                const data = await res.json();
+                return res.ok && data.valid === true;
+              } catch {
+                // 探测请求本身失败（断网）→ 认为 token 可能还有效，允许重试
+                return true;
+              }
             }
 
             function sendMsg() {
               const input = document.getElementById('chat-input');
               if (input.value.trim() && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(input.value); // 服务端注入身份
+                ws.send(input.value);
                 input.value = '';
               }
             }
