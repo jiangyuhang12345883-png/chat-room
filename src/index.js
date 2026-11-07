@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ⚠️⚠️⚠️ 请把这里的地址换成你自己的 Cloud Mail 实际 API 地址 ⚠️⚠️⚠️
+// ⚠️ 1. API 地址（别带斜杠）
 const CLOUD_MAIL_API = "https://mail.yuhang.dpdns.org/api/login";
+// ⚠️ 2. 注册跳转地址
+const CLOUD_MAIL_REGISTER_URL = "https://mail.yuhang.dpdns.org";
 
 export class ChatRoom extends DurableObject {
   constructor(ctx, env) {
@@ -49,7 +51,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // 1. 接收前端发来的登录验证请求
+    // 1. 登录验证接口
     if (url.pathname === "/api/verify" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -60,7 +62,6 @@ export default {
           return new Response(JSON.stringify({ success: false, msg: "账号或密码不能为空" }), { status: 400 });
         }
 
-        // 2. Worker 去请求你的 Cloud Mail 验证
         const mailRes = await fetch(CLOUD_MAIL_API, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -69,9 +70,12 @@ export default {
 
         if (mailRes.ok) {
           const mailData = await mailRes.json();
+          // 返回真实的 token 和邮箱给前端保存
+          const token = mailData.token || "fallback_token_" + Date.now();
           return new Response(JSON.stringify({ 
             success: true, 
-            token: mailData.token || "verified_ok" 
+            token: token,
+            email: email
           }), { headers: { "Content-Type": "application/json" } });
         } else {
           return new Response(JSON.stringify({ success: false, msg: "Cloud Mail 账号或密码错误" }), { status: 401 });
@@ -81,7 +85,7 @@ export default {
       }
     }
 
-    // 3. 返回聊天室网页（带真实登录框）
+    // 2. 网页界面
     if (request.headers.get("Upgrade") !== "websocket") {
       const html = `
         <!DOCTYPE html>
@@ -89,7 +93,7 @@ export default {
         <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>聊天室 - 需要登录</title>
+          <title>聊天室</title>
           <style>
             body { font-family: sans-serif; background: #121212; color: #fff; display: flex; flex-direction: column; height: 100vh; margin: 0; }
             #login-box { padding: 20px; max-width: 300px; margin: 50px auto; background: #1e1e1e; border-radius: 8px; }
@@ -106,7 +110,6 @@ export default {
           </style>
         </head>
         <body>
-          <!-- 登录区域 -->
           <div id="login-box">
             <h3 style="margin-top:0;">登录聊天室</h3>
             <div id="error-msg"></div>
@@ -114,13 +117,11 @@ export default {
             <input type="password" id="password" placeholder="密码">
             <button onclick="verifyLogin()">验证并进入</button>
             
-            <!-- 注册引导小字 -->
             <div style="text-align: center; margin-top: 15px; font-size: 13px; color: #9ca3af;">
-              第一次使用？<a href="https://mail.yuhang.dpdns.org" target="_blank" style="color: #3b82f6; text-decoration: none;">注册</a>
+              第一次使用？<a href="${CLOUD_MAIL_REGISTER_URL}" target="_blank" style="color: #3b82f6; text-decoration: none;">注册</a>
             </div>
           </div>
 
-          <!-- 聊天区域 -->
           <div id="chat-container">
             <div id="messages"></div>
             <div id="input-area">
@@ -131,6 +132,17 @@ export default {
 
           <script>
             let ws;
+
+            // 页面一加载，先检查有没有历史登录记录
+            window.onload = () => {
+              const savedToken = localStorage.getItem('chat_token');
+              const savedEmail = localStorage.getItem('chat_email');
+              
+              if (savedToken && savedEmail) {
+                // 如果有记录，直接进聊天室
+                goToChat(savedEmail);
+              }
+            };
 
             async function verifyLogin() {
               const email = document.getElementById('email').value;
@@ -156,10 +168,11 @@ export default {
                 const data = await res.json();
 
                 if (data.success) {
-                  document.getElementById('login-box').style.display = 'none';
-                  document.getElementById('chat-container').style.display = 'flex';
-                  window.myEmail = email;
-                  initChat();
+                  // 把 Token 和邮箱存进浏览器
+                  localStorage.setItem('chat_token', data.token);
+                  localStorage.setItem('chat_email', data.email);
+                  // 进入聊天室
+                  goToChat(data.email);
                 } else {
                   errorMsg.textContent = data.msg || "验证失败";
                   errorMsg.style.display = 'block';
@@ -170,6 +183,13 @@ export default {
                 errorMsg.style.display = 'block';
                 document.querySelector('#login-box button').textContent = '验证并进入';
               }
+            }
+
+            function goToChat(email) {
+              document.getElementById('login-box').style.display = 'none';
+              document.getElementById('chat-container').style.display = 'flex';
+              window.myEmail = email;
+              initChat();
             }
 
             function initChat() {
@@ -204,6 +224,7 @@ export default {
       return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
+    // WebSocket 连接处理
     const stub = env.CHAT_ROOM.getByName("global-room");
     return stub.fetch(request);
   },
