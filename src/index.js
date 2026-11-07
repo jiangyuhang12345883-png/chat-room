@@ -35,8 +35,7 @@ function extractToken(obj) {
 }
 
 // 验证 Cloud Mail token
-// 不再死磕单一接口：多路径 + 带/不带 Bearer 都试一遍，
-// 全失败才判无效（避免接口路径写错误杀合法用户）
+// 多路径 + 带/不带 Bearer 都试一遍，全失败才判无效
 async function verifyCloudMailToken(token) {
   const endpoints = ["/api/account/list", "/api/user/info", "/api/account"];
   const auths = [token, `Bearer ${token}`];
@@ -135,7 +134,7 @@ export default {
         const password = body.password;
 
         if (!email || !password || !email.toLowerCase().endsWith(ALLOWED_DOMAIN.toLowerCase())) {
-          return json({ success: false, msg: "请使用本站专属邮箱后缀登录" }, 400);
+          return json({ success: false, msg: "请使用专用邮箱登录" }, 400);
         }
 
         const mailRes = await fetch(CLOUD_MAIL_API, {
@@ -144,7 +143,7 @@ export default {
           body: JSON.stringify({ email, password }),
         });
 
-        // 先取文本再解析，打印真实结构方便排查
+        // 先取文本再解析，便于日志排查（原始返回只进 console，不进用户界面）
         const rawText = await mailRes.text();
         console.log("MAIL STATUS:", mailRes.status);
         console.log("MAIL BODY:", rawText);
@@ -156,7 +155,7 @@ export default {
           mailData = {};
         }
 
-        // 关键修复：兼容 { token } / { data: { token } } 等结构
+        // 兼容 { token } / { data: { token } } 等结构
         const token = extractToken(mailData);
 
         if (mailRes.ok && token) {
@@ -166,19 +165,16 @@ export default {
             email: email.toLowerCase(),
           });
         } else {
-          // 把真实返回也带回去，便于前端/日志定位
-          return json(
-            {
-              success: false,
-              msg: "账号或密码错误",
-              debug_status: mailRes.status,
-              debug_body: rawText.slice(0, 300),
-            },
-            401
-          );
+          // 透传 Cloud Mail 真实业务提示（如"输入的邮箱不存在"）
+          const bizMsg =
+            mailData?.message ||
+            mailData?.msg ||
+            "账号或密码错误";
+          return json({ success: false, msg: bizMsg }, 401);
         }
       } catch (err) {
-        return json({ success: false, msg: "验证服务器异常: " + err.message }, 500);
+        console.log("VERIFY ERROR:", err.message);
+        return json({ success: false, msg: "验证服务器异常" }, 500);
       }
     }
 
@@ -310,17 +306,13 @@ export default {
                   localStorage.setItem('chat_email', data.email);
                   goToChat(data.email, data.token);
                 } else {
-                  // 把调试信息也显示出来，方便定位
-                  let msg = data.msg || "验证失败";
-                  if (data.debug_status || data.debug_body) {
-                    msg += " | status=" + data.debug_status + " body=" + (data.debug_body || "");
-                  }
-                  errorMsg.textContent = msg;
+                  // 只显示后端透传的真实提示，不再拼 JSON
+                  errorMsg.textContent = data.msg || "验证失败";
                   errorMsg.style.display = 'block';
                   btn.textContent = '验证并进入';
                 }
               } catch (err) {
-                errorMsg.textContent = "网络错误：" + err.message;
+                errorMsg.textContent = "网络错误，请重试";
                 errorMsg.style.display = 'block';
                 btn.textContent = '验证并进入';
               }
