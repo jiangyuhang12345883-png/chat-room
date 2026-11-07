@@ -1,8 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ⚠️⚠️⚠️ 请把这里的地址换成你自己的 Cloud Mail 实际地址 ⚠️⚠️⚠️
-// 注意：不要带有最后的斜杠 /
-const CLOUD_MAIL_API = "https://mail.yuhang.dpdns.org/api/login";
+// ⚠️⚠️⚠️ 请把这里的地址换成你自己的 Cloud Mail 实际 API 地址 ⚠️⚠️⚠️
+const CLOUD_MAIL_API = "https://你的CloudMail域名/api/login";
 
 export class ChatRoom extends DurableObject {
   constructor(ctx, env) {
@@ -61,20 +60,18 @@ export default {
           return new Response(JSON.stringify({ success: false, msg: "账号或密码不能为空" }), { status: 400 });
         }
 
-        // 2. Worker 在后台偷偷去请求你的 Cloud Mail 验证
+        // 2. Worker 去请求你的 Cloud Mail 验证
         const mailRes = await fetch(CLOUD_MAIL_API, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: email, password: password })
         });
 
-        // 3. 如果 Cloud Mail 返回成功，我们就放行
         if (mailRes.ok) {
           const mailData = await mailRes.json();
-          // 这里的 token 是你 Cloud Mail 发的凭证，我们可以存下来作为后续的通行证
           return new Response(JSON.stringify({ 
             success: true, 
-            token: mailData.token || "verified_ok" // 兼容不同版本的返回格式
+            token: mailData.token || "verified_ok" 
           }), { headers: { "Content-Type": "application/json" } });
         } else {
           return new Response(JSON.stringify({ success: false, msg: "Cloud Mail 账号或密码错误" }), { status: 401 });
@@ -84,7 +81,7 @@ export default {
       }
     }
 
-    // 4. 返回聊天室网页（带真实登录框）
+    // 3. 返回聊天室网页（带真实登录框）
     if (request.headers.get("Upgrade") !== "websocket") {
       const html = `
         <!DOCTYPE html>
@@ -111,11 +108,16 @@ export default {
         <body>
           <!-- 登录区域 -->
           <div id="login-box">
-            <h3>登录聊天室</h3>
+            <h3 style="margin-top:0;">登录聊天室</h3>
             <div id="error-msg"></div>
             <input type="email" id="email" placeholder="Cloud Mail 邮箱" autocomplete="off">
             <input type="password" id="password" placeholder="密码">
             <button onclick="verifyLogin()">验证并进入</button>
+            
+            <!-- 注册引导小字 -->
+            <div style="text-align: center; margin-top: 15px; font-size: 13px; color: #9ca3af;">
+              第一次使用？<a href="https://你的CloudMail域名" target="_blank" style="color: #3b82f6; text-decoration: none;">注册</a>
+            </div>
           </div>
 
           <!-- 聊天区域 -->
@@ -130,7 +132,6 @@ export default {
           <script>
             let ws;
 
-            // 第一步：把账号密码发给我们的 Worker 去验证
             async function verifyLogin() {
               const email = document.getElementById('email').value;
               const password = document.getElementById('password').value;
@@ -155,12 +156,9 @@ export default {
                 const data = await res.json();
 
                 if (data.success) {
-                  // 验证成功，隐藏登录框，显示聊天室
                   document.getElementById('login-box').style.display = 'none';
                   document.getElementById('chat-container').style.display = 'flex';
-                  // 把邮箱存起来，发消息时带上
                   window.myEmail = email;
-                  // 连接 WebSocket
                   initChat();
                 } else {
                   errorMsg.textContent = data.msg || "验证失败";
@@ -174,7 +172,6 @@ export default {
               }
             }
 
-            // 第二步：连接 WebSocket
             function initChat() {
               const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
               ws = new WebSocket(wsUrl);
@@ -192,13 +189,11 @@ export default {
             function sendMsg() {
               const input = document.getElementById('chat-input');
               if (input.value.trim() && ws && ws.readyState === WebSocket.OPEN) {
-                // 发送消息时，带上自己的邮箱前缀
                 ws.send(window.myEmail.split('@')[0] + ": " + input.value);
                 input.value = '';
               }
             }
 
-            // 回车发送消息
             document.getElementById('chat-input').addEventListener("keypress", (e) => {
               if (e.key === "Enter") sendMsg();
             });
@@ -209,7 +204,6 @@ export default {
       return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
-    // WebSocket 连接处理
     const stub = env.CHAT_ROOM.getByName("global-room");
     return stub.fetch(request);
   },
