@@ -146,7 +146,6 @@ export default {
 
         const rawText = await mailRes.text();
         console.log("MAIL STATUS:", mailRes.status);
-        console.log("MAIL BODY:", rawText);
 
         let mailData = {};
         try {
